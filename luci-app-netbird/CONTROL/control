@@ -1,0 +1,13 @@
+Package: luci-app-netbird
+Version: 1.1.4-1
+Depends: libc, luci-base
+Source: local
+License: MIT
+Section: luci
+Architecture: all
+Installed-Size: 176
+Maintainer: Maikel
+Description: NetBird mesh VPN for GL.iNet routers: native admin-panel page (Applications > NetBird) plus LuCI pages.
+ Installs/updates the official NetBird binary (checksum verified), runs it
+ as a procd service, shows status and peers, and creates a firewall zone.
+ Built for GL.iNet Mudi 7 (GL-E5800, OpenWrt 23.05) and other OpenWrt routers.

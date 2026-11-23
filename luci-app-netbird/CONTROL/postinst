@@ -1,0 +1,23 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+chmod 755 /usr/libexec/netbird-luci /etc/init.d/netbird
+# options added in later versions: keep existing configs complete
+for kv in network_monitor=1 clear_setup_key=1 log_level=info; do
+	uci -q get "netbird.main.${kv%%=*}" >/dev/null || uci -q set "netbird.main.$kv"
+done
+# update source baked in by build.sh (e.g. the GitHub repo that built the release)
+if [ -z "$(uci -q get netbird.main.update_repo)" ] && [ -s /usr/share/netbird-luci/update_repo ]; then
+	uci -q set netbird.main.update_repo="$(head -n1 /usr/share/netbird-luci/update_repo)"
+fi
+uci -q commit netbird
+mkdir -p /etc/netbird && chmod 700 /etc/netbird
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+/etc/init.d/rpcd reload 2>/dev/null
+[ "$(uci -q get netbird.main.enabled)" = 1 ] && /etc/init.d/netbird enable && /etc/init.d/netbird restart
+# GL admin panel: nginx caches the Lua RPC modules, so new or changed
+# methods only appear after its workers restart. Graceful reload, delayed so
+# a panel request that started this install can still finish.
+if [ -x /etc/init.d/nginx ] && [ -f /usr/share/gl-ngx/oui-rpc.lua ]; then
+	(sleep 3; /etc/init.d/nginx reload) </dev/null >/dev/null 2>&1 &
+fi
+exit 0

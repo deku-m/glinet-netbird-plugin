@@ -1,0 +1,49 @@
+{
+	"luci-app-netbird": {
+		"description": "Grant access to NetBird",
+		"read": {
+			"file": {
+				"/usr/libexec/netbird-luci status": [
+					"exec"
+				],
+				"/usr/libexec/netbird-luci job": [
+					"exec"
+				],
+				"/usr/libexec/netbird-luci logs *": [
+					"exec"
+				]
+			},
+			"uci": [
+				"netbird"
+			]
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/netbird-luci install *": [
+					"exec"
+				],
+				"/usr/libexec/netbird-luci up": [
+					"exec"
+				],
+				"/usr/libexec/netbird-luci down": [
+					"exec"
+				],
+				"/usr/libexec/netbird-luci stop": [
+					"exec"
+				],
+				"/usr/libexec/netbird-luci deregister": [
+					"exec"
+				],
+				"/usr/libexec/netbird-luci firewall": [
+					"exec"
+				],
+				"/usr/libexec/netbird-luci uninstall *": [
+					"exec"
+				]
+			},
+			"uci": [
+				"netbird"
+			]
+		}
+	}
+}

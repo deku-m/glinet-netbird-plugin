@@ -1,0 +1,9 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+for s in netbird netbird_lan_fwd lan_netbird_fwd; do uci -q delete firewall.$s; done
+uci -q delete network.netbird
+uci commit firewall; uci commit network
+/etc/init.d/firewall reload 2>/dev/null
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+echo "NetBird binary (/usr/bin/netbird) and state (/etc/netbird) were kept; remove them by hand if wanted."
+exit 0

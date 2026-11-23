@@ -1,0 +1,275 @@
+-- /usr/lib/oui-httpd/rpc/netbird
+-- GL.iNet 4.x admin panel (OUI) backend for NetBird.
+-- Called by the panel as $rpcRequest('call', ['sid', 'netbird', <method>, {...}]).
+-- All real work is done by /usr/libexec/netbird-luci (shared with LuCI);
+-- this file only validates input and translates to/from JSON.
+
+local cjson = require "cjson"
+
+local HELPER = "/usr/libexec/netbird-luci"
+
+local M = {}
+
+local function sh_quote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+local function run(cmd)
+    local p = io.popen(cmd .. " 2>&1")
+    if not p then return "" end
+    local out = p:read("*a") or ""
+    p:close()
+    return out
+end
+
+local function helper(args)
+    return run(HELPER .. " " .. args)
+end
+
+local function helper_json(args)
+    local out = helper(args)
+    local ok, data = pcall(cjson.decode, out)
+    if ok and type(data) == "table" then return data end
+    return { ok = false, error = (out:gsub("%s+$", "")) }
+end
+
+local function uci_get(opt)
+    local v = run("uci -q get netbird.main." .. opt):gsub("%s+$", "")
+    return v
+end
+
+local function uci_set(opt, value)
+    run("uci -q set netbird.main." .. opt .. "=" .. sh_quote(value))
+end
+
+-- Option names are fixed here, so they never come from the request.
+local BOOL_OPTS = {
+    "enabled", "clear_setup_key", "network_monitor", "disable_dns",
+    "disable_client_routes", "disable_server_routes", "block_inbound",
+    "allow_server_ssh", "firewall_zone", "lan_to_netbird", "netbird_to_lan",
+    "masquerade"
+}
+
+-- Same defaults netbird-luci uses when an option is missing from the config.
+local BOOL_DEFAULTS = {
+    network_monitor = true, disable_dns = true, firewall_zone = true,
+    lan_to_netbird = true, netbird_to_lan = true, masquerade = true
+}
+
+local LOG_LEVELS = { error = true, warn = true, info = true, debug = true, trace = true }
+
+local function as_bool(v)
+    return v == true or v == 1 or v == "1" or v == "true"
+end
+
+local function no_ctl(s)
+    return not s:find("[%c]")
+end
+
+-- Each validator returns the cleaned value, or nil plus an error message.
+local VALIDATE = {
+    management_url = function(v)
+        if v == "" then return v end
+        if #v <= 256 and no_ctl(v) and v:match("^https?://[%w%.%-_:%[%]/]+$") then return v end
+        return nil, "Management URL must look like https://host[:port]"
+    end,
+    hostname = function(v)
+        if v == "" then return v end
+        if #v <= 63 and v:match("^[%w][%w%-%.]*$") then return v end
+        return nil, "Peer name may only contain letters, digits, '-' and '.'"
+    end,
+    wireguard_port = function(v)
+        if v == "" then return v end
+        local n = v:match("^%d+$") and tonumber(v)
+        if n and n >= 1 and n <= 65535 then return tostring(n) end
+        return nil, "Port must be 1-65535"
+    end,
+    log_level = function(v)
+        if LOG_LEVELS[v] then return v end
+        return nil, "Invalid log level"
+    end,
+    extra_args = function(v)
+        if v == "" then return v end
+        if #v <= 256 and v:match("^[%w%-%._=,/: ]+$") then return v end
+        return nil, "Extra arguments contain unsupported characters"
+    end,
+    update_repo = function(v)
+        v = v:gsub("^%s+", ""):gsub("%s+$", ""):gsub("^https://github.com/", ""):gsub("%.git$", ""):gsub("/+$", "")
+        if v == "" then return v end
+        if #v <= 100 and v:match("^[%w_%.%-]+/[%w_%.%-]+$") then return v end
+        return nil, "Update repository must look like owner/repo"
+    end,
+    setup_key = function(v)
+        if #v <= 128 and v:match("^[%w%-]+$") then return v end
+        return nil, "Setup key may only contain letters, digits and '-'"
+    end
+}
+
+local TEXT_OPTS = { "management_url", "hostname", "wireguard_port", "log_level", "extra_args", "update_repo" }
+
+local function read_config()
+    local cfg = {}
+    for _, o in ipairs(BOOL_OPTS) do
+        local v = uci_get(o)
+        if v == "" then cfg[o] = BOOL_DEFAULTS[o] or false else cfg[o] = (v == "1") end
+    end
+    for _, o in ipairs(TEXT_OPTS) do cfg[o] = uci_get(o) end
+    -- never send the secret back to the browser
+    cfg.has_setup_key = (uci_get("setup_key") ~= "")
+    return cfg
+end
+
+function M.status()
+    local st = helper_json("status")
+    st.config = read_config()
+    return st
+end
+
+-- Only on explicit request from the page ("Show stored key"); status and
+-- get_config never include the key.
+function M.get_setup_key()
+    return { key = uci_get("setup_key") }
+end
+
+function M.get_config()
+    return read_config()
+end
+
+function M.set_config(args)
+    args = args or {}
+    local clean = {}
+
+    for _, o in ipairs(TEXT_OPTS) do
+        if args[o] ~= nil then
+            local v, err = VALIDATE[o](tostring(args[o]))
+            if v == nil then return { ok = false, error = err } end
+            clean[o] = v
+        end
+    end
+
+    -- empty setup key in the request means "keep the stored one"
+    if args.setup_key ~= nil and tostring(args.setup_key) ~= "" then
+        local v, err = VALIDATE.setup_key(tostring(args.setup_key))
+        if v == nil then return { ok = false, error = err } end
+        clean.setup_key = v
+    end
+    if as_bool(args.forget_setup_key) then clean.setup_key = "" end
+
+    for _, o in ipairs(BOOL_OPTS) do
+        if args[o] ~= nil then clean[o] = as_bool(args[o]) and "1" or "0" end
+    end
+
+    for k, v in pairs(clean) do uci_set(k, v) end
+    run("uci -q commit netbird")
+    helper("firewall")
+    return { ok = true, config = read_config() }
+end
+
+function M.install(args)
+    local v = tostring((args or {}).version or "latest")
+    if v == "" then v = "latest" end
+    if v ~= "latest" and not v:match("^v?%d+%.%d+%.%d+$") then
+        return { ok = false, error = "Version must look like 0.60.1 or 'latest'" }
+    end
+    return helper_json("install " .. v)
+end
+
+function M.up()
+    return helper_json("up")
+end
+
+function M.down()
+    return helper_json("down")
+end
+
+function M.stop()
+    return helper_json("stop")
+end
+
+function M.deregister()
+    return helper_json("deregister")
+end
+
+function M.uninstall(args)
+    local mode = ((args or {}).deregister == false) and "keep" or "deregister"
+    return helper_json("uninstall " .. mode)
+end
+
+-- ---------- plugin updates ----------
+
+local UPLOAD_IPK = "/tmp/netbird-plugin-upload.ipk"
+local MAX_UPLOAD = 4 * 1024 * 1024
+
+function M.plugin_check()
+    return helper_json("plugin_check")
+end
+
+function M.plugin_update()
+    return helper_json("plugin_update")
+end
+
+-- The admin panel's RPC layer rejects long or "unusual" strings (-32602), so
+-- the page sends the package as lowercase hex in small chunks, in order.
+local UPLOAD_PART = UPLOAD_IPK .. ".part"
+local MAX_CHUNK_HEX = 16384
+
+local function file_size(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local n = f:seek("end")
+    f:close()
+    return n
+end
+
+local function hex_to_bin(hex)
+    return (hex:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
+end
+
+function M.plugin_upload_chunk(args)
+    args = args or {}
+    local index, total, offset, hex = tonumber(args.index), tonumber(args.total), tonumber(args.offset), args.hex
+    local function bad(msg) os.remove(UPLOAD_PART); return { ok = false, error = msg } end
+
+    if not (index and total and offset) or index % 1 ~= 0 or total % 1 ~= 0 or offset % 1 ~= 0
+        or index < 0 or total < 1 or index >= total or offset < 0 then
+        return bad("Invalid upload chunk")
+    end
+    if type(hex) ~= "string" or #hex == 0 or #hex > MAX_CHUNK_HEX or #hex % 2 ~= 0 or hex:find("[^0-9a-f]") then
+        return bad("Invalid upload data")
+    end
+    if offset + #hex / 2 > MAX_UPLOAD then return bad("Package file is too large") end
+
+    if index == 0 then
+        if offset ~= 0 then return bad("Invalid upload chunk") end
+        run("umask 077; : > " .. UPLOAD_PART)
+    elseif file_size(UPLOAD_PART) ~= offset then
+        return bad("Upload chunks arrived out of order, please try again")
+    end
+
+    local f = io.open(UPLOAD_PART, "ab")
+    if not f then return bad("Cannot write to /tmp") end
+    f:write(hex_to_bin(hex))
+    f:close()
+
+    if index < total - 1 then return { ok = true, received = file_size(UPLOAD_PART) } end
+
+    local f2 = io.open(UPLOAD_PART, "rb")
+    local magic = f2 and f2:read(2) or ""
+    if f2 then f2:close() end
+    if magic ~= "\31\139" then return bad("This is not an .ipk package") end
+    os.remove(UPLOAD_IPK)
+    os.rename(UPLOAD_PART, UPLOAD_IPK)
+    return helper_json("plugin_install_file")
+end
+
+function M.job()
+    return helper_json("job")
+end
+
+function M.logs(args)
+    local n = tonumber((args or {}).lines) or 200
+    n = math.max(1, math.min(2000, math.floor(n)))
+    return { log = helper("logs " .. n) }
+end
+
+return M

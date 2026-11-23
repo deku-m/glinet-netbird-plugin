@@ -1,0 +1,556 @@
+#!/bin/sh
+# Backend helper for luci-app-netbird. Called by LuCI through rpcd (file.exec).
+# Long-running actions (install, up) run as a background job so the rpcd
+# exec timeout is never hit; the UI polls "job".
+
+. /lib/functions.sh
+
+# The panel runs this without HOME; the netbird CLI then warns that it cannot
+# find its config dir. Keep its small per-user state with the daemon's state.
+[ -n "${HOME:-}" ] || export HOME=/root
+export XDG_CONFIG_HOME=/etc/netbird/cli
+
+BIN=/usr/bin/netbird
+SOCK=unix:///var/run/netbird.sock
+SOCK_PATH=/var/run/netbird.sock
+LOG=/var/log/netbird/client.log
+STATE_DIR=/etc/netbird
+JOB_LOG=/tmp/netbird-luci-job.log
+JOB_PID=/tmp/netbird-luci-job.pid
+JOB_NAME=/tmp/netbird-luci-job.name
+REL_LATEST=https://pkgs.netbird.io/releases/latest
+REL_BASE=https://github.com/netbirdio/netbird/releases/download
+
+json_str() {
+	# minimal JSON string escaping for short values
+	printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n\r')"
+}
+
+nb_arch() {
+	case "$(uname -m)" in
+		aarch64|arm64) echo arm64 ;;
+		x86_64) echo amd64 ;;
+		i?86) echo 386 ;;
+		armv6*|armv7*|armv8l) echo armv6 ;;
+		*) echo unsupported ;;
+	esac
+}
+
+fetch() {
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 15 --retry 2 -o "$2" "$1"
+	else
+		wget -q -T 30 -O "$2" "$1"
+	fi
+}
+
+daemon_running() {
+	pidof netbird >/dev/null 2>&1 && [ -S "$SOCK_PATH" ]
+}
+
+job_running() {
+	[ -f "$JOB_PID" ] || return 1
+	pid="$(cat "$JOB_PID")"
+	[ -r "/proc/$pid/stat" ] || return 1
+	# an unreaped (zombie) job has finished
+	[ "$(cut -d' ' -f3 "/proc/$pid/stat")" != Z ]
+}
+
+start_job() {
+	if job_running; then
+		echo "another task is still running: $(cat "$JOB_NAME" 2>/dev/null)" >&2
+		exit 1
+	fi
+	echo "$1" > "$JOB_NAME"
+	: > "$JOB_LOG"
+	"$0" _run "$@" </dev/null >>"$JOB_LOG" 2>&1 &
+	echo $! > "$JOB_PID"
+	echo '{"started":true}'
+}
+
+wait_socket() {
+	i=0
+	while [ $i -lt 20 ]; do
+		[ -S "$SOCK_PATH" ] && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# Free KiB on the filesystem that really receives writes to $1. On OpenWrt/GL
+# firmware / is an overlay over a read-only squashfs; busybox df on a path
+# can report the full squashfs (0 free), so the overlay upper dir is used.
+free_kb() {
+	if [ "${1#/tmp}" = "$1" ] && awk '$2 == "/" && $3 == "overlay" {r=1} $2 == "/overlay" {o=1}
+		END {exit !(r && o)}' /proc/mounts 2>/dev/null; then
+		set -- /overlay
+	fi
+	df -Pk "$1" 2>/dev/null | awk 'NR > 1 {a = $4} END {print a + 0}'
+}
+
+# "netbird version" is cached per binary mtime+size: the UI polls status every
+# few seconds and starting the Go binary costs CPU and RAM on the router.
+VER_CACHE=/tmp/netbird-luci-version
+bin_version() {
+	# busybox has no stat applet on OpenWrt; ls size + date -r mtime is enough
+	# shellcheck disable=SC2012
+	stamp="$(ls -ln "$BIN" | awk '{print $5}') $(date -r "$BIN" +%s 2>/dev/null)"
+	if [ -f "$VER_CACHE" ] && [ "$(head -n1 "$VER_CACHE")" = "$stamp" ]; then
+		sed -n 2p "$VER_CACHE"
+		return
+	fi
+	v="$("$BIN" version 2>/dev/null | head -n1)"
+	printf '%s\n%s\n' "$stamp" "$v" > "$VER_CACHE"
+	echo "$v"
+}
+
+# ---------- actions ----------
+
+do_status() {
+	installed=false version="" running=false st=null
+	if [ -x "$BIN" ]; then
+		installed=true
+		version="$(bin_version)"
+	fi
+	if daemon_running; then
+		running=true
+		st="$("$BIN" status --json --daemon-addr "$SOCK" 2>/dev/null)"
+		[ -n "$st" ] || st=null
+	fi
+	jr=false; job_running && jr=true
+	printf '{"installed":%s,"version":%s,"arch":%s,"running":%s,"job_running":%s,"status":%s}\n' \
+		"$installed" "$(json_str "$version")" "$(json_str "$(nb_arch)")" "$running" "$jr" "$st"
+}
+
+do_install() {
+	set -e
+	ver="$1"
+	arch="$(nb_arch)"
+	[ "$arch" != unsupported ] || { echo "Unsupported CPU architecture: $(uname -m)"; exit 1; }
+
+	if [ -z "$ver" ] || [ "$ver" = latest ]; then
+		echo "Looking up latest NetBird release..."
+		meta=/tmp/netbird-latest.json
+		fetch "$REL_LATEST" "$meta"
+		ver="$(jsonfilter -i "$meta" -e '@.tag_name' 2>/dev/null || true)"
+		rm -f "$meta"
+	fi
+	ver="v${ver#v}"
+	echo "$ver" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "Invalid version: $ver"; exit 1; }
+
+	plain="${ver#v}"
+	tarball="netbird_${plain}_linux_${arch}.tar.gz"
+	sums="netbird_${plain}_checksums.txt"
+	work=/tmp/netbird-install
+	rm -rf "$work"; mkdir -p "$work"
+	trap 'rm -rf "$work"' EXIT
+
+	free_tmp=$(free_kb /tmp)
+	[ "$free_tmp" -gt 81920 ] || { echo "Not enough free space in /tmp (need ~80 MB)"; exit 1; }
+
+	echo "Downloading $tarball ..."
+	fetch "$REL_BASE/$ver/$tarball" "$work/$tarball"
+	echo "Downloading checksums ..."
+	fetch "$REL_BASE/$ver/$sums" "$work/$sums"
+
+	expected="$(grep " ${tarball}\$" "$work/$sums" | awk '{print $1}')"
+	actual="$(sha256sum "$work/$tarball" | awk '{print $1}')"
+	[ -n "$expected" ] && [ "$expected" = "$actual" ] || {
+		echo "Checksum mismatch, refusing to install (expected '$expected', got '$actual')"
+		exit 1
+	}
+	echo "Checksum OK"
+
+	tar -xzf "$work/$tarball" -C "$work"
+	[ -f "$work/netbird" ] || { echo "netbird binary not found in archive"; exit 1; }
+	chmod 755 "$work/netbird"
+	"$work/netbird" version >/dev/null 2>&1 || { echo "Downloaded binary does not run on this device"; exit 1; }
+
+	need=$(du -k "$work/netbird" | awk '{print $1}')
+	free_root=$(free_kb /usr/bin)
+	old=0; [ -f "$BIN" ] && old=$(du -k "$BIN" | awk '{print $1}')
+	[ $((free_root + old)) -gt $((need + 2048)) ] || {
+		echo "Not enough flash space: need $((need / 1024)) MB, have $(((free_root + old) / 1024)) MB"
+		exit 1
+	}
+
+	was_running=0; daemon_running && was_running=1
+	[ $was_running = 1 ] && { echo "Stopping NetBird..."; /etc/init.d/netbird stop || true; }
+	mv -f "$work/netbird" "$BIN"
+	echo "Installed $("$BIN" version) to $BIN"
+	[ -c /dev/net/tun ] || echo "WARNING: /dev/net/tun missing, NetBird cannot create its interface (kmod-tun needed)"
+
+	if [ "$(uci -q get netbird.main.enabled)" = 1 ]; then
+		/etc/init.d/netbird enable
+		/etc/init.d/netbird start
+		echo "NetBird service started"
+	fi
+	echo "DONE"
+}
+
+build_up_args() {
+	config_load netbird
+	config_get mgmt main management_url
+	config_get host main hostname
+	config_get port main wireguard_port
+	config_get extra main extra_args
+	config_get_bool dns main disable_dns 1
+	config_get_bool ccr main disable_client_routes 0
+	config_get_bool csr main disable_server_routes 0
+	config_get_bool bin main block_inbound 0
+	config_get_bool ssh main allow_server_ssh 0
+	config_get_bool mon main network_monitor 1
+
+	tf() { [ "$1" = 1 ] && echo true || echo false; }
+
+	set -- up --daemon-addr "$SOCK"
+	[ -n "$mgmt" ] && set -- "$@" --management-url "$mgmt"
+	[ -n "$host" ] && set -- "$@" --hostname "$host"
+	[ -n "$port" ] && set -- "$@" --wireguard-port "$port"
+	set -- "$@" "--disable-dns=$(tf "$dns")" \
+		"--disable-client-routes=$(tf "$ccr")" \
+		"--disable-server-routes=$(tf "$csr")" \
+		"--block-inbound=$(tf "$bin")" \
+		"--allow-server-ssh=$(tf "$ssh")" \
+		"--network-monitor=$(tf "$mon")"
+	UP_ARGS_FILE=/tmp/netbird-up.args
+	: > "$UP_ARGS_FILE"
+	for a in "$@"; do printf '%s\n' "$a" >> "$UP_ARGS_FILE"; done
+	# extra args are split on whitespace on purpose, but never glob-expanded
+	set -f
+	for a in $extra; do printf '%s\n' "$a" >> "$UP_ARGS_FILE"; done
+	set +f
+}
+
+do_up() {
+	[ -x "$BIN" ] || { echo "NetBird binary not installed"; exit 1; }
+	uci -q set netbird.main.enabled=1 && uci commit netbird
+	/etc/init.d/netbird enable
+	if ! daemon_running; then
+		echo "Starting NetBird daemon..."
+		/etc/init.d/netbird start
+	fi
+	wait_socket || { echo "Daemon did not come up, see log"; exit 1; }
+	sleep 1
+
+	build_up_args
+	key="$(uci -q get netbird.main.setup_key)"
+	keyfile=""
+	if [ -n "$key" ]; then
+		keyfile=/tmp/netbird-setup-key
+		(umask 077; printf '%s' "$key" > "$keyfile")
+		echo "--setup-key-file" >> "$UP_ARGS_FILE"
+		echo "$keyfile" >> "$UP_ARGS_FILE"
+	fi
+
+	set --
+	while IFS= read -r a; do set -- "$@" "$a"; done < "$UP_ARGS_FILE"
+	rm -f "$UP_ARGS_FILE"
+
+	echo "Running: netbird $(echo "$*" | sed 's#/tmp/netbird-setup-key#<setup key>#')"
+	rc=0
+	"$BIN" "$@" || rc=$?
+	[ -n "$keyfile" ] && rm -f "$keyfile"
+
+	if [ $rc -eq 0 ]; then
+		if [ -n "$key" ] && [ "$(uci -q get netbird.main.clear_setup_key)" = 1 ]; then
+			uci -q set netbird.main.setup_key='' && uci commit netbird
+			echo "Peer registered; setup key removed from config"
+		fi
+		do_firewall
+		echo "DONE"
+	else
+		echo "netbird up failed (exit $rc)"
+		exit $rc
+	fi
+}
+
+do_down() {
+	[ -x "$BIN" ] && daemon_running && "$BIN" down --daemon-addr "$SOCK" >/dev/null 2>&1
+	# "netbird down" is not persisted by the daemon; without this the router
+	# reconnects on the next boot. Connect (do_up) turns it back on.
+	uci -q set netbird.main.enabled=0 && uci -q commit netbird
+	echo '{"ok":true}'
+}
+
+do_stop() {
+	daemon_running && "$BIN" down --daemon-addr "$SOCK" >/dev/null 2>&1
+	uci -q set netbird.main.enabled=0 && uci commit netbird
+	/etc/init.d/netbird stop
+	/etc/init.d/netbird disable
+	echo '{"ok":true}'
+}
+
+do_deregister() {
+	daemon_running || { echo '{"ok":false,"error":"daemon not running"}'; exit 0; }
+	"$BIN" down --daemon-addr "$SOCK" >/dev/null 2>&1
+	"$BIN" deregister --daemon-addr "$SOCK" >/dev/null 2>&1
+	echo '{"ok":true}'
+}
+
+# Removes everything: optional deregistration, service, binary, state, the
+# package itself and its config. Runs from a copy in /tmp because opkg removes
+# this script while it is still running.
+do_uninstall() {
+	mode="$1"
+	echo "Uninstalling NetBird..."
+	if [ -x "$BIN" ] && [ "$mode" = deregister ] && [ -f "$STATE_DIR/default.json" ] && ! daemon_running; then
+		echo "Starting NetBird to remove this router from the network..."
+		uci -q set netbird.main.enabled=1
+		/etc/init.d/netbird start
+		wait_socket || echo "WARNING: daemon did not start"
+		sleep 2
+	fi
+	if [ -x "$BIN" ] && daemon_running; then
+		"$BIN" down --daemon-addr "$SOCK" >/dev/null 2>&1
+		if [ "$mode" = deregister ]; then
+			if "$BIN" deregister --daemon-addr "$SOCK" >/dev/null 2>&1; then
+				echo "Router removed from the NetBird network"
+			else
+				echo "WARNING: could not remove the router from the network; delete it in the NetBird dashboard"
+			fi
+		fi
+	fi
+	/etc/init.d/netbird stop >/dev/null 2>&1
+	/etc/init.d/netbird disable >/dev/null 2>&1
+	rm -f "$BIN" "$VER_CACHE"
+	rm -rf "$STATE_DIR" /var/log/netbird
+	echo "Removed NetBird client and its data"
+	if opkg list-installed 2>/dev/null | grep -q '^luci-app-netbird '; then
+		echo "Removing package luci-app-netbird..."
+		opkg remove luci-app-netbird 2>&1 | grep -v '^$' || true
+	fi
+	rm -f /etc/config/netbird /etc/config/netbird-opkg
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
+	echo "DONE"
+}
+
+start_uninstall() {
+	if job_running; then
+		echo "another task is still running: $(cat "$JOB_NAME" 2>/dev/null)" >&2
+		exit 1
+	fi
+	copy=/tmp/netbird-uninstall.sh
+	cp "$0" "$copy" && chmod 700 "$copy"
+	echo uninstall > "$JOB_NAME"
+	: > "$JOB_LOG"
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$copy" _run uninstall "$1" </dev/null >>"$JOB_LOG" 2>&1 &
+	else
+		"$copy" _run uninstall "$1" </dev/null >>"$JOB_LOG" 2>&1 &
+	fi
+	echo $! > "$JOB_PID"
+	echo '{"started":true}'
+}
+
+# ---------- plugin (this package) updates ----------
+# Releases are expected at https://github.com/<owner>/<repo>/releases with the
+# assets luci-app-netbird_<version>_all.ipk and SHA256SUMS. The
+# releases/latest/download URLs redirect to the newest release, so no GitHub
+# API (and no rate limit) is involved.
+PKG=luci-app-netbird
+UPLOAD_IPK=/tmp/netbird-plugin-upload.ipk
+
+plugin_version() {
+	opkg list-installed "$PKG" 2>/dev/null | awk '{print $3; exit}'
+}
+
+plugin_repo() {
+	r="$(uci -q get netbird.main.update_repo)"
+	echo "$r" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' && echo "$r"
+}
+
+# newer <a> <b>: true when version a is newer than b
+newer() {
+	opkg compare-versions "$1" '>>' "$2" 2>/dev/null && return 0
+	[ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | tail -n1)" = "$1" ]
+}
+
+# prints "<sha256> <filename>" of the newest release, or fails
+plugin_latest() {
+	repo="$(plugin_repo)" || return 1
+	sums=/tmp/netbird-plugin-sums
+	fetch "https://github.com/$repo/releases/latest/download/SHA256SUMS" "$sums" || { rm -f "$sums"; return 1; }
+	line="$(grep -E "^[0-9a-f]{64}[ *]+${PKG}_[A-Za-z0-9.~+-]+_all\.ipk\$" "$sums" | head -n1)"
+	rm -f "$sums"
+	[ -n "$line" ] || return 1
+	echo "$line" | awk '{f=$2; sub(/^\*/, "", f); print $1, f}'
+}
+
+do_plugin_check() {
+	. /usr/share/libubox/jshn.sh
+	json_init
+	cur="$(plugin_version)"
+	json_add_string current "$cur"
+	repo="$(plugin_repo)"
+	json_add_string repo "$repo"
+	if [ -z "$repo" ]; then
+		json_add_string error "No update repository set"
+	elif latest="$(plugin_latest)"; then
+		file="${latest#* }"
+		ver="${file#"${PKG}"_}"; ver="${ver%_all.ipk}"
+		json_add_string latest "$ver"
+		if [ -n "$cur" ] && newer "$ver" "$cur"; then json_add_boolean update_available 1; else json_add_boolean update_available 0; fi
+	else
+		json_add_string error "Could not read SHA256SUMS from the latest release of $repo"
+	fi
+	json_dump
+}
+
+# Verifies that an .ipk really is this package before handing it to opkg.
+check_ipk() {
+	f="$1"
+	[ -s "$f" ] || { echo "Package file is empty"; return 1; }
+	[ "$(wc -c < "$f")" -le 4194304 ] || { echo "Package file is too large"; return 1; }
+	name="$(tar -xzOf "$f" ./control.tar.gz 2>/dev/null | tar -xzO ./control 2>/dev/null | awk -F': ' '$1 == "Package" {print $2; exit}')"
+	[ "$name" = "$PKG" ] || { echo "Not a $PKG package (found: '${name:-unreadable}')"; return 1; }
+	tar -xzOf "$f" ./control.tar.gz 2>/dev/null | tar -xzO ./control | awk -F': ' '$1 == "Version" {print "Package version: " $2}'
+}
+
+do_plugin_update() {
+	work=/tmp/netbird-plugin-dl
+	rm -rf "$work"; mkdir -p "$work"
+	echo "Looking up the latest plugin release..."
+	latest="$(plugin_latest)" || { echo "Could not read the latest release from $(plugin_repo)"; rm -rf "$work"; exit 1; }
+	sum="${latest%% *}"; file="${latest#* }"
+	echo "Downloading $file ..."
+	fetch "https://github.com/$(plugin_repo)/releases/latest/download/$file" "$work/$file" || { echo "Download failed"; rm -rf "$work"; exit 1; }
+	[ "$(sha256sum "$work/$file" | awk '{print $1}')" = "$sum" ] || { echo "Checksum mismatch, refusing to install"; rm -rf "$work"; exit 1; }
+	echo "Checksum OK"
+	plugin_install "$work/$file"
+	rm -rf "$work"
+}
+
+do_plugin_install_file() {
+	plugin_install "$UPLOAD_IPK"
+	rm -f "$UPLOAD_IPK"
+}
+
+plugin_install() {
+	check_ipk "$1" || exit 1
+	echo "Installing..."
+	if opkg install "$1" 2>&1; then
+		echo "Plugin is now version $(plugin_version)"
+		echo "DONE"
+	else
+		echo "opkg install failed"
+		exit 1
+	fi
+}
+
+# Runs a job from a copy in /tmp: opkg replaces this script while installing.
+start_plugin_job() {
+	if job_running; then
+		echo "another task is still running: $(cat "$JOB_NAME" 2>/dev/null)" >&2
+		exit 1
+	fi
+	copy=/tmp/netbird-plugin-job.sh
+	cp "$0" "$copy" && chmod 700 "$copy"
+	echo "$1" > "$JOB_NAME"
+	: > "$JOB_LOG"
+	"$copy" _run "$1" </dev/null >>"$JOB_LOG" 2>&1 &
+	echo $! > "$JOB_PID"
+	echo '{"started":true}'
+}
+
+# Network interface + firewall zone for wt0, driven by UCI options.
+do_firewall() {
+	config_load netbird
+	config_get_bool fw main firewall_zone 1
+	config_get_bool l2n main lan_to_netbird 1
+	config_get_bool n2l main netbird_to_lan 1
+	config_get_bool masq main masquerade 1
+
+	changed=0
+	if [ "$fw" = 1 ]; then
+		if [ "$(uci -q get network.netbird)" != interface ]; then
+			uci set network.netbird=interface
+			uci set network.netbird.proto=none
+			uci set network.netbird.device=wt0
+			uci commit network
+			changed=1
+		fi
+		uci -q delete firewall.netbird
+		uci set firewall.netbird=zone
+		uci set firewall.netbird.name=netbird
+		uci set firewall.netbird.input=ACCEPT
+		uci set firewall.netbird.output=ACCEPT
+		uci set firewall.netbird.forward=ACCEPT
+		uci set firewall.netbird.masq="$masq"
+		uci set firewall.netbird.mtu_fix=1
+		uci add_list firewall.netbird.network=netbird
+		uci -q delete firewall.netbird_lan_fwd
+		uci -q delete firewall.lan_netbird_fwd
+		if [ "$n2l" = 1 ]; then
+			uci set firewall.netbird_lan_fwd=forwarding
+			uci set firewall.netbird_lan_fwd.src=netbird
+			uci set firewall.netbird_lan_fwd.dest=lan
+		fi
+		if [ "$l2n" = 1 ]; then
+			uci set firewall.lan_netbird_fwd=forwarding
+			uci set firewall.lan_netbird_fwd.src=lan
+			uci set firewall.lan_netbird_fwd.dest=netbird
+		fi
+		uci commit firewall
+		changed=1
+	else
+		for s in netbird netbird_lan_fwd lan_netbird_fwd; do
+			uci -q delete firewall.$s && changed=1
+		done
+		uci commit firewall
+		if uci -q get network.netbird >/dev/null; then
+			uci delete network.netbird; uci commit network; changed=1
+		fi
+	fi
+	if [ $changed = 1 ]; then
+		/etc/init.d/network reload >/dev/null 2>&1
+		/etc/init.d/firewall reload >/dev/null 2>&1
+	fi
+	echo "Firewall zone: $([ "$fw" = 1 ] && echo applied || echo removed)"
+}
+
+do_job() {
+	. /usr/share/libubox/jshn.sh
+	json_init
+	if job_running; then json_add_boolean running 1; else json_add_boolean running 0; fi
+	json_add_string name "$(cat "$JOB_NAME" 2>/dev/null)"
+	json_add_string log "$(tail -n 40 "$JOB_LOG" 2>/dev/null)"
+	json_dump
+}
+
+do_logs() {
+	n="${1:-200}"
+	case "$n" in ''|*[!0-9]*) n=200 ;; esac
+	[ "$n" -gt 2000 ] && n=2000
+	[ -f "$LOG" ] && tail -n "$n" "$LOG" || echo "(no log yet)"
+}
+
+case "$1" in
+	status) do_status ;;
+	install) start_job install "${2:-latest}" ;;
+	up) start_job up ;;
+	down) do_down ;;
+	stop) do_stop ;;
+	deregister) do_deregister ;;
+	firewall) do_firewall ;;
+	plugin_check) do_plugin_check ;;
+	plugin_update) plugin_repo >/dev/null || { echo "no update repository set" >&2; exit 1; }; start_plugin_job plugin_update ;;
+	plugin_install_file) [ -s "$UPLOAD_IPK" ] || { echo "no uploaded package" >&2; exit 1; }; start_plugin_job plugin_install_file ;;
+	uninstall)
+		case "$2" in deregister|keep) start_uninstall "$2" ;; *) echo "usage: $0 uninstall deregister|keep" >&2; exit 1 ;; esac
+		;;
+	job) do_job ;;
+	logs) do_logs "$2" ;;
+	_run)
+		shift
+		case "$1" in
+			install) do_install "$2" ;;
+			up) do_up ;;
+			uninstall) do_uninstall "$2" ;;
+			plugin_update) do_plugin_update ;;
+			plugin_install_file) do_plugin_install_file ;;
+		esac
+		;;
+	*) echo "usage: $0 status|install [ver]|up|down|stop|deregister|uninstall deregister|keep|firewall|job|logs [n]" >&2; exit 1 ;;
+esac
