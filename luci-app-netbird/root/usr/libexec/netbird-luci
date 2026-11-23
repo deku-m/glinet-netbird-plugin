@@ -178,6 +178,7 @@ do_install() {
 	was_running=0; daemon_running && was_running=1
 	[ $was_running = 1 ] && { echo "Stopping NetBird..."; /etc/init.d/netbird stop || true; }
 	mv -f "$work/netbird" "$BIN"
+	invalidate_checks
 	echo "Installed $("$BIN" version) to $BIN"
 	[ -c /dev/net/tun ] || echo "WARNING: /dev/net/tun missing, NetBird cannot create its interface (kmod-tun needed)"
 
@@ -367,6 +368,10 @@ client_latest() {
 	echo "$v"
 }
 
+invalidate_checks() {
+	rm -f /tmp/netbird-luci-check-client.json /tmp/netbird-luci-check-plugin.json
+}
+
 client_current() {
 	[ -x "$BIN" ] || return 1
 	v="$(bin_version)"
@@ -374,7 +379,7 @@ client_current() {
 	echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' && echo "$v"
 }
 
-do_client_check() {
+client_check_now() {
 	. /usr/share/libubox/jshn.sh
 	json_init
 	cur="$(client_current)"
@@ -428,6 +433,41 @@ do_cron() {
 	echo '{"ok":true}'
 }
 
+# ---------- update checks without blocking the web server ----------
+# The admin panel runs RPC calls inside its nginx worker, so a check that
+# waits on GitHub would stall the whole panel. Checks therefore answer from a
+# cache at once and refresh it in the background; the page polls while
+# "checking" is true.
+CHECK_TTL=21600
+
+# cached_check <name> <function> [fresh]
+cached_check() {
+	cache="/tmp/netbird-luci-check-$1.json"
+	lock="/tmp/netbird-luci-check-$1.lock"
+	age=999999
+	[ -s "$cache" ] && age=$(( $(date +%s) - $(date -r "$cache" +%s 2>/dev/null || echo 0) ))
+	if [ "$3" = fresh ] || [ "$age" -ge "$CHECK_TTL" ]; then
+		if mkdir "$lock" 2>/dev/null; then
+			if [ "$3" = fresh ]; then rm -f "$cache"; fi
+			# fully detached: the caller reads our stdout until EOF
+			( "$0" _check "$1" "$2"; rmdir "$lock" ) </dev/null >/dev/null 2>&1 &
+		elif [ -d "$lock" ] && [ $(( $(date +%s) - $(date -r "$lock" +%s 2>/dev/null || echo 0) )) -gt 120 ]; then
+			rmdir "$lock" 2>/dev/null
+		fi
+	fi
+	if [ -s "$cache" ] && [ "$3" != fresh ]; then
+		cat "$cache"
+	else
+		echo '{"checking":true}'
+	fi
+}
+
+run_check() {
+	cache="/tmp/netbird-luci-check-$1.json"
+	"$2" fresh > "$cache.tmp" && [ -s "$cache.tmp" ] && mv -f "$cache.tmp" "$cache"
+	rm -f "$cache.tmp"
+}
+
 # ---------- plugin (this package) updates ----------
 # Releases are expected at https://github.com/<owner>/<repo>/releases with the
 # assets luci-app-netbird_<version>_all.ipk and SHA256SUMS. The
@@ -462,7 +502,7 @@ plugin_latest() {
 	echo "$line" | awk '{f=$2; sub(/^\*/, "", f); print $1, f}'
 }
 
-do_plugin_check() {
+plugin_check_now() {
 	. /usr/share/libubox/jshn.sh
 	json_init
 	cur="$(plugin_version)"
@@ -515,6 +555,7 @@ plugin_install() {
 	check_ipk "$1" || exit 1
 	echo "Installing..."
 	if opkg install "$1" 2>&1; then
+		invalidate_checks
 		echo "Plugin is now version $(plugin_version)"
 		echo "DONE"
 	else
@@ -618,10 +659,11 @@ case "$1" in
 	stop) do_stop ;;
 	deregister) do_deregister ;;
 	firewall) do_firewall ;;
-	client_check) do_client_check "$2" ;;
+	client_check) cached_check client client_check_now "$2" ;;
 	client_autoupdate) do_client_autoupdate ;;
 	cron) do_cron ;;
-	plugin_check) do_plugin_check ;;
+	plugin_check) cached_check plugin plugin_check_now "$2" ;;
+	_check) run_check "$2" "$3" ;;
 	plugin_update) plugin_repo >/dev/null || { echo "no update repository set" >&2; exit 1; }; start_plugin_job plugin_update ;;
 	plugin_install_file) [ -s "$UPLOAD_IPK" ] || { echo "no uploaded package" >&2; exit 1; }; start_plugin_job plugin_install_file ;;
 	uninstall)

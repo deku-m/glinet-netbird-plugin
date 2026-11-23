@@ -163,6 +163,7 @@ function M.set_config(args)
     run("uci -q commit netbird")
     helper("firewall")
     if args.client_autoupdate ~= nil then helper("cron") end
+    if args.update_repo ~= nil then os.remove("/tmp/netbird-luci-check-plugin.json") end
     return { ok = true, config = read_config() }
 end
 
@@ -205,8 +206,8 @@ function M.client_check(args)
     return helper_json(((args or {}).fresh == true) and "client_check fresh" or "client_check")
 end
 
-function M.plugin_check()
-    return helper_json("plugin_check")
+function M.plugin_check(args)
+    return helper_json(((args or {}).fresh == true) and "plugin_check fresh" or "plugin_check")
 end
 
 function M.plugin_update()

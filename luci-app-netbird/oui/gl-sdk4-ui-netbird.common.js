@@ -342,17 +342,32 @@ module.exports = (function () {
         }).catch(function (e) { self.busy = false; self.say('error', errText(e)); });
       },
 
+      // Update checks answer at once; while the router looks things up in the
+      // background they return {checking: true} and the page asks again.
+      pollCheck: function (method, fresh, done, tries) {
+        var self = this;
+        tries = tries || 0;
+        return rpc(method, fresh ? { fresh: true } : {}).then(function (r) {
+          if (r && r.checking && tries < 15) {
+            setTimeout(function () { if (!self._isDestroyed) self.pollCheck(method, false, done, tries + 1); }, 2000);
+            return;
+          }
+          done(r && r.checking ? { error: 'The update check did not finish. Try again later.' } : r, null);
+        }).catch(function (e) { done(null, e); });
+      },
+
       checkClient: function (manual) {
         var self = this;
         self.clientChecking = true;
-        return rpc('client_check', manual ? { fresh: true } : {}).then(function (r) {
+        self.pollCheck('client_check', !!manual, function (r, e) {
           self.clientChecking = false;
+          if (e) { if (manual) self.say('error', errText(e)); return; }
           self.client = r || {};
           if (manual) {
             if (r && r.error) self.say('error', r.error);
             else if (r && !r.update_available) self.say('success', 'NetBird ' + (r.current || '') + ' is the latest version.');
           }
-        }).catch(function (e) { self.clientChecking = false; if (manual) self.say('error', errText(e)); });
+        });
       },
 
       setAutoUpdate: function (v) {
@@ -367,15 +382,16 @@ module.exports = (function () {
       checkPlugin: function (manual) {
         var self = this;
         self.pluginChecking = true;
-        return rpc('plugin_check').then(function (r) {
+        self.pollCheck('plugin_check', !!manual, function (r, e) {
           self.pluginChecking = false;
+          if (e) { if (manual) self.say('error', errText(e)); return; }
           self.plugin = r || {};
           if (self.repoInput === null) self.repoInput = (r && r.repo) || '';
           if (manual && r && r.repo) {
             if (r.error) self.say('error', r.error);
             else if (!r.update_available) self.say('success', 'The plugin is up to date (' + r.current + ').');
           }
-        }).catch(function (e) { self.pluginChecking = false; if (manual) self.say('error', errText(e)); });
+        });
       },
 
       saveRepo: function () {
