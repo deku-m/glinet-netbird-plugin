@@ -92,12 +92,15 @@ rm /usr/share/oui/menu.d/netbird.json /www/views/gl-sdk4-ui-netbird.common.js.gz
 
 ### Making a release
 
+On GitHub: **Releases > Draft a new release**, create a new tag such as
+`v1.2.4`, and press **Publish release**. Or from a terminal:
+
 ```sh
 git tag v1.2.4
 git push origin v1.2.4
 ```
 
-The *Release* workflow checks the scripts, builds the package with
+Either way the *Release* workflow checks the scripts, builds the package with
 `./build.sh` and publishes `luci-app-netbird_<version>-1_all.ipk` plus
 `SHA256SUMS`. Routers find new versions through
 `releases/latest/download/SHA256SUMS`.
