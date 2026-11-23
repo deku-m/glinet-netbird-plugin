@@ -39,6 +39,9 @@ same package also adds pages to LuCI (VPN > NetBird).
   registration (`/etc/netbird`) across sysupgrade.
 - **Firewall zone** `netbird` (interface `wt0`) with optional LAN ↔ NetBird
   forwarding and masquerade.
+- **NetBird client updates**: shows when a new NetBird release is out and
+  installs it in one tap, or automatically every night. A specific version
+  (also an older one) can be installed too.
 - **Plugin updates** from this repository's releases, or by uploading an `.ipk`
   in the panel.
 - **Uninstall** in one tap, optionally removing the router from your NetBird
@@ -74,7 +77,9 @@ same package also adds pages to LuCI (VPN > NetBird).
 
 - **Update to x.y.z** appears when a newer release is published here.
 - **Upload .ipk** installs a downloaded package file directly.
-- **Update NetBird client** updates the NetBird client itself.
+- **NetBird client**: **Update to x.y.z** installs a new NetBird release. Turn
+  on **Update NetBird automatically** to do this every night around 04:00.
+  The NetBird client is updated on its own; no new plugin release is needed.
 
 Settings and the NetBird registration are kept on every update.
 

@@ -2,6 +2,10 @@
 [ -n "$IPKG_INSTROOT" ] && exit 0
 for s in netbird netbird_lan_fwd lan_netbird_fwd; do uci -q delete firewall.$s; done
 uci -q delete network.netbird
+if [ -f /etc/crontabs/root ] && grep -q 'netbird-luci autoupdate' /etc/crontabs/root; then
+	sed -i '/netbird-luci autoupdate/d' /etc/crontabs/root
+	/etc/init.d/cron restart 2>/dev/null
+fi
 uci commit firewall; uci commit network
 /etc/init.d/firewall reload 2>/dev/null
 rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null

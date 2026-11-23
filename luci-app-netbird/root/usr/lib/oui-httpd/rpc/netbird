@@ -47,7 +47,7 @@ local BOOL_OPTS = {
     "enabled", "clear_setup_key", "network_monitor", "disable_dns",
     "disable_client_routes", "disable_server_routes", "block_inbound",
     "allow_server_ssh", "firewall_zone", "lan_to_netbird", "netbird_to_lan",
-    "masquerade"
+    "masquerade", "client_autoupdate"
 }
 
 -- Same defaults netbird-luci uses when an option is missing from the config.
@@ -162,6 +162,7 @@ function M.set_config(args)
     for k, v in pairs(clean) do uci_set(k, v) end
     run("uci -q commit netbird")
     helper("firewall")
+    if args.client_autoupdate ~= nil then helper("cron") end
     return { ok = true, config = read_config() }
 end
 
@@ -199,6 +200,10 @@ end
 
 local UPLOAD_IPK = "/tmp/netbird-plugin-upload.ipk"
 local MAX_UPLOAD = 4 * 1024 * 1024
+
+function M.client_check(args)
+    return helper_json(((args or {}).fresh == true) and "client_check fresh" or "client_check")
+end
 
 function M.plugin_check()
     return helper_json("plugin_check")

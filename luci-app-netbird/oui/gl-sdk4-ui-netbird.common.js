@@ -176,6 +176,8 @@ module.exports = (function () {
         showAdvanced: false,
         showKey: false,
         plugin: null,
+        client: null,
+        clientChecking: false,
         pluginChecking: false,
         repoInput: null,
         pluginUpdated: false,
@@ -199,6 +201,7 @@ module.exports = (function () {
     created: function () {
       this.refresh();
       this.checkPlugin();
+      this.checkClient();
       this.statusTimer = setInterval(this.refresh, 5000);
     },
 
@@ -281,6 +284,7 @@ module.exports = (function () {
               self.jobActive = false;
               var ok = /DONE\s*$/.test(j.log || '');
               var isPlugin = /^plugin_/.test(j.name || '');
+              if (j.name === 'install') self.checkClient();
               if (ok && isPlugin) { self.pluginUpdated = true; self.notice = null; }
               else self.say(ok ? 'success' : 'error', ok ? (j.name === 'install' ? 'NetBird installed.' : 'NetBird is connecting.') :
                 'The task failed, see the output below.');
@@ -336,6 +340,28 @@ module.exports = (function () {
           self.say('success', 'Settings saved. Press Connect to apply them to NetBird.');
           self.refresh();
         }).catch(function (e) { self.busy = false; self.say('error', errText(e)); });
+      },
+
+      checkClient: function (manual) {
+        var self = this;
+        self.clientChecking = true;
+        return rpc('client_check', manual ? { fresh: true } : {}).then(function (r) {
+          self.clientChecking = false;
+          self.client = r || {};
+          if (manual) {
+            if (r && r.error) self.say('error', r.error);
+            else if (r && !r.update_available) self.say('success', 'NetBird ' + (r.current || '') + ' is the latest version.');
+          }
+        }).catch(function (e) { self.clientChecking = false; if (manual) self.say('error', errText(e)); });
+      },
+
+      setAutoUpdate: function (v) {
+        var self = this;
+        self.client = Object.assign({}, self.client || {}, { autoupdate: v });
+        rpc('set_config', { client_autoupdate: v }).then(function (r) {
+          if (!r || r.ok === false) { self.say('error', (r && r.error) || 'Saving failed'); self.checkClient(); return; }
+          self.say('success', v ? 'NetBird will update itself every night when a new version is out.' : 'Automatic NetBird updates are off.');
+        }).catch(function (e) { self.say('error', errText(e)); self.checkClient(); });
       },
 
       checkPlugin: function (manual) {
@@ -724,11 +750,7 @@ module.exports = (function () {
         var self = this;
         return h('div', { style: CARD }, [
           cardTitle(h, 'Maintenance'),
-          field(h, 'Update NetBird client', 'Installs the official release after checking its SHA-256 checksum. Leave empty for the latest version.',
-            h('div', { style: { display: 'flex', gap: '8px', width: '100%', maxWidth: '340px' } }, [
-              input(h, self.version, function (v) { self.version = v; }, { placeholder: 'latest' }),
-              btn(h, 'Update', function () { self.startJob('install', { version: (self.version || 'latest').trim() }); }, 'plain', self.busy || self.jobActive)
-            ])),
+          self.rClient(h),
           self.rPlugin(h),
           field(h, 'Client log', 'Last 300 lines of the NetBird log.',
             btn(h, self.showLog ? 'Hide log' : 'Show log', self.toggleLog, 'plain')),
@@ -744,6 +766,31 @@ module.exports = (function () {
             btn(h, 'Uninstall', function () { self.confirmUninstall = true; }, 'danger', self.busy || self.jobActive || self.uninstalling)
           ]),
           self.confirmUninstall ? self.rUninstallConfirm(h) : null
+        ]);
+      },
+
+      rClient: function (h) {
+        var self = this, cl = self.client || {};
+        var busy = self.busy || self.jobActive || self.uninstalling;
+        var line;
+        if (self.clientChecking) line = 'Checking for a new NetBird version…';
+        else if (cl.update_available) line = 'Installed ' + cl.current + ' · version ' + cl.latest + ' is available.';
+        else if (cl.latest) line = 'Installed ' + (cl.current || '?') + ' · up to date.';
+        else line = cl.error || 'Official release, checked against its SHA-256 checksum.';
+        return h('div', {}, [
+          field(h, 'NetBird client', line,
+            h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' } }, [
+              cl.update_available
+                ? btn(h, 'Update to ' + cl.latest, function () { self.startJob('install', { version: cl.latest }); }, 'primary', busy)
+                : btn(h, 'Check for updates', function () { self.checkClient(true); }, 'plain', busy || self.clientChecking)
+            ])),
+          field(h, 'Update NetBird automatically', 'Checks every night around 04:00 and installs a new NetBird release. Settings and registration are kept.',
+            toggle(h, !!cl.autoupdate, self.setAutoUpdate, busy)),
+          field(h, 'Install a specific version', 'For example to go back to an older NetBird release.',
+            h('div', { style: { display: 'flex', gap: '8px', width: '100%', maxWidth: '340px' } }, [
+              input(h, self.version, function (v) { self.version = v; }, { placeholder: 'e.g. 0.60.1' }),
+              btn(h, 'Install', function () { self.startJob('install', { version: (self.version || 'latest').trim() }); }, 'plain', busy || !(self.version || '').trim())
+            ]))
         ]);
       },
 

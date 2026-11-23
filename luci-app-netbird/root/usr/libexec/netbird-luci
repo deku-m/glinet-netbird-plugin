@@ -314,7 +314,8 @@ do_uninstall() {
 	fi
 	/etc/init.d/netbird stop >/dev/null 2>&1
 	/etc/init.d/netbird disable >/dev/null 2>&1
-	rm -f "$BIN" "$VER_CACHE"
+	uci -q set netbird.main.client_autoupdate=0 && do_cron >/dev/null
+	rm -f "$BIN" "$VER_CACHE" "$CLIENT_CACHE"
 	rm -rf "$STATE_DIR" /var/log/netbird
 	echo "Removed NetBird client and its data"
 	if opkg list-installed 2>/dev/null | grep -q '^luci-app-netbird '; then
@@ -342,6 +343,89 @@ start_uninstall() {
 	fi
 	echo $! > "$JOB_PID"
 	echo '{"started":true}'
+}
+
+# ---------- NetBird client updates ----------
+CLIENT_CACHE=/tmp/netbird-luci-latest
+CRON_FILE=/etc/crontabs/root
+CRON_TAG="# netbird-luci autoupdate"
+
+# Newest NetBird release (e.g. 0.84.0), cached for 6 hours. "fresh" skips the cache.
+client_latest() {
+	if [ "$1" != fresh ] && [ -s "$CLIENT_CACHE" ] \
+		&& [ $(( $(date +%s) - $(date -r "$CLIENT_CACHE" +%s 2>/dev/null || echo 0) )) -lt 21600 ]; then
+		cat "$CLIENT_CACHE"
+		return
+	fi
+	meta=/tmp/netbird-latest.json
+	fetch "$REL_LATEST" "$meta" || { rm -f "$meta"; return 1; }
+	v="$(jsonfilter -i "$meta" -e '@.tag_name' 2>/dev/null)"
+	rm -f "$meta"
+	v="${v#v}"
+	echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || return 1
+	echo "$v" > "$CLIENT_CACHE"
+	echo "$v"
+}
+
+client_current() {
+	[ -x "$BIN" ] || return 1
+	v="$(bin_version)"
+	v="${v#v}"
+	echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' && echo "$v"
+}
+
+do_client_check() {
+	. /usr/share/libubox/jshn.sh
+	json_init
+	cur="$(client_current)"
+	json_add_string current "$cur"
+	if latest="$(client_latest "$1")"; then
+		json_add_string latest "$latest"
+		if [ -n "$cur" ] && newer "$latest" "$cur"; then json_add_boolean update_available 1; else json_add_boolean update_available 0; fi
+	else
+		json_add_string error "Could not look up the latest NetBird release"
+	fi
+	if [ "$(uci -q get netbird.main.client_autoupdate)" = 1 ]; then json_add_boolean autoupdate 1; else json_add_boolean autoupdate 0; fi
+	json_dump
+}
+
+# Run from cron: update the client when a newer release exists.
+do_client_autoupdate() {
+	[ "$(uci -q get netbird.main.client_autoupdate)" = 1 ] || exit 0
+	cur="$(client_current)" || exit 0
+	latest="$(client_latest fresh)" || { logger -t netbird "autoupdate: release lookup failed"; exit 0; }
+	newer "$latest" "$cur" || exit 0
+	if job_running; then logger -t netbird "autoupdate: another task is running, trying next time"; exit 0; fi
+	logger -t netbird "autoupdate: updating NetBird $cur -> $latest"
+	echo install > "$JOB_NAME"
+	: > "$JOB_LOG"
+	echo $$ > "$JOB_PID"
+	if (do_install "$latest") >>"$JOB_LOG" 2>&1; then
+		logger -t netbird "autoupdate: NetBird updated to $latest"
+	else
+		logger -t netbird "autoupdate: update failed, see the plugin task log"
+	fi
+}
+
+# Adds or removes the nightly autoupdate line in root's crontab.
+do_cron() {
+	touch "$CRON_FILE"
+	grep -v "$CRON_TAG" "$CRON_FILE" > "$CRON_FILE.nb" || true
+	if [ "$(uci -q get netbird.main.client_autoupdate)" = 1 ]; then
+		# keep the minute once chosen; random so routers do not all hit GitHub at once
+		min="$(grep "$CRON_TAG" "$CRON_FILE" | awk 'NR == 1 {print $1}')"
+		case "$min" in ''|*[!0-9]*) min=$(( $(head -c 2 /dev/urandom | od -An -tu2 | tr -d ' ') % 60 )) ;; esac
+		echo "$min 4 * * * /usr/libexec/netbird-luci client_autoupdate $CRON_TAG" >> "$CRON_FILE.nb"
+	fi
+	if cmp -s "$CRON_FILE.nb" "$CRON_FILE"; then
+		rm -f "$CRON_FILE.nb"
+	else
+		cat "$CRON_FILE.nb" > "$CRON_FILE"
+		rm -f "$CRON_FILE.nb"
+		/etc/init.d/cron enable >/dev/null 2>&1
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+	echo '{"ok":true}'
 }
 
 # ---------- plugin (this package) updates ----------
@@ -534,6 +618,9 @@ case "$1" in
 	stop) do_stop ;;
 	deregister) do_deregister ;;
 	firewall) do_firewall ;;
+	client_check) do_client_check "$2" ;;
+	client_autoupdate) do_client_autoupdate ;;
+	cron) do_cron ;;
 	plugin_check) do_plugin_check ;;
 	plugin_update) plugin_repo >/dev/null || { echo "no update repository set" >&2; exit 1; }; start_plugin_job plugin_update ;;
 	plugin_install_file) [ -s "$UPLOAD_IPK" ] || { echo "no uploaded package" >&2; exit 1; }; start_plugin_job plugin_install_file ;;
