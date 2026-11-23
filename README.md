@@ -9,6 +9,21 @@ same package also adds pages to LuCI (VPN > NetBird).
 > This is a community project. It is not affiliated with or endorsed by
 > GL.iNet or NetBird.
 
+## Screenshots
+
+<p>
+  <img src="docs/screenshots/status.png" width="560" alt="NetBird page in the GL.iNet admin panel: connection status and peers">
+  <img src="docs/screenshots/phone.png" width="200" alt="The same page on a phone">
+</p>
+
+<details>
+<summary>Settings and maintenance</summary>
+<br>
+<img src="docs/screenshots/settings.png" width="560" alt="Settings, plugin updates and uninstall">
+</details>
+
+<sub>Screenshots show sample data.</sub>
+
 ## Features
 
 - **Install the official client** from NetBird's GitHub releases, verified

@@ -596,11 +596,11 @@ module.exports = (function () {
             style: { display: 'flex', alignItems: 'center', gap: '12px', padding: '11px 0', borderBottom: '1px solid ' + C.line, flexWrap: 'wrap' }
           }, [
             h('span', { style: { width: '8px', height: '8px', borderRadius: '50%', background: on ? C.green : '#c9ced6', flex: '0 0 auto' } }),
-            h('div', { style: { flex: '1 1 160px', minWidth: '0' } }, [
-              h('div', { style: { fontSize: '14px', color: C.text, fontWeight: '500' } }, name || '—'),
+            h('div', { style: { flex: '1 1 0', minWidth: '0' } }, [
+              h('div', { style: { fontSize: '14px', color: C.text, fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, name || '—'),
               h('div', { style: { fontSize: '12px', color: C.sub } }, p.netbirdIp || '')
             ]),
-            h('div', { style: { fontSize: '12px', color: C.sub, textAlign: 'right', flex: '0 0 auto' } }, on ? [
+            h('div', { style: { fontSize: '12px', color: C.sub, textAlign: 'right', flex: '0 0 auto', marginLeft: 'auto' } }, on ? [
               h('div', {}, (p.connectionType || '') + ' · ' + fmtLatency(p.latency)),
               h('div', {}, '↓ ' + fmtBytes(p.transferReceived) + '  ↑ ' + fmtBytes(p.transferSent))
             ] : [h('div', {}, p.status || 'Offline')])
