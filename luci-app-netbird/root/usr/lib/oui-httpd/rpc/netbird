@@ -10,6 +10,10 @@ local HELPER = "/usr/libexec/netbird-luci"
 
 local M = {}
 
+local function sh_quote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
 local function run(cmd)
     local p = io.popen(cmd .. " 2>&1")
     if not p then return "" end
@@ -29,33 +33,13 @@ local function helper_json(args)
     return { ok = false, error = (out:gsub("%s+$", "")) }
 end
 
--- All options of netbird.main from one "uci show" (the page polls status
--- every 5 s; one uci call per option meant ~20 processes per refresh).
--- uci prints values as 'text', with a literal ' written as '\''.
-local function uci_all()
-    local all = {}
-    for line in run("uci -q show netbird.main"):gmatch("[^\n]+") do
-        local k, v = line:match("^netbird%.main%.([%w_]+)=(.*)$")
-        if k then
-            if #v >= 2 and v:sub(1, 1) == "'" and v:sub(-1) == "'" then
-                v = v:sub(2, -2):gsub("'\\''", "'")
-            end
-            all[k] = v
-        end
-    end
-    return all
+local function uci_get(opt)
+    local v = run("uci -q get netbird.main." .. opt):gsub("%s+$", "")
+    return v
 end
 
--- Writes all changed options and commits in one "uci batch".
-local function uci_set_all(values)
-    local p = io.popen("uci batch >/dev/null 2>&1", "w")
-    if not p then return false end
-    for k, v in pairs(values) do
-        p:write("set netbird.main.", k, "='", v, "'\n")
-    end
-    p:write("commit netbird\n")
-    p:close()
-    return true
+local function uci_set(opt, value)
+    run("uci -q set netbird.main." .. opt .. "=" .. sh_quote(value))
 end
 
 -- Option names are fixed here, so they never come from the request.
@@ -124,14 +108,14 @@ local VALIDATE = {
 local TEXT_OPTS = { "management_url", "hostname", "wireguard_port", "log_level", "extra_args", "update_repo" }
 
 local function read_config()
-    local all, cfg = uci_all(), {}
+    local cfg = {}
     for _, o in ipairs(BOOL_OPTS) do
-        local v = all[o] or ""
+        local v = uci_get(o)
         if v == "" then cfg[o] = BOOL_DEFAULTS[o] or false else cfg[o] = (v == "1") end
     end
-    for _, o in ipairs(TEXT_OPTS) do cfg[o] = all[o] or "" end
+    for _, o in ipairs(TEXT_OPTS) do cfg[o] = uci_get(o) end
     -- never send the secret back to the browser
-    cfg.has_setup_key = ((all.setup_key or "") ~= "")
+    cfg.has_setup_key = (uci_get("setup_key") ~= "")
     return cfg
 end
 
@@ -144,7 +128,7 @@ end
 -- Only on explicit request from the page ("Show stored key"); status and
 -- get_config never include the key.
 function M.get_setup_key()
-    return { key = uci_all().setup_key or "" }
+    return { key = uci_get("setup_key") }
 end
 
 function M.get_config()
@@ -175,14 +159,8 @@ function M.set_config(args)
         if args[o] ~= nil then clean[o] = as_bool(args[o]) and "1" or "0" end
     end
 
-    -- validators already refuse quotes and control characters; uci batch
-    -- quoting has no escape, so check once more before writing
-    for _, v in pairs(clean) do
-        if v:find("['%c]") then return { ok = false, error = "Invalid character in settings" } end
-    end
-    if next(clean) ~= nil and not uci_set_all(clean) then
-        return { ok = false, error = "Could not save settings" }
-    end
+    for k, v in pairs(clean) do uci_set(k, v) end
+    run("uci -q commit netbird")
     if args.firewall_zone ~= nil or args.lan_to_netbird ~= nil or args.netbird_to_lan ~= nil or args.masquerade ~= nil then
         helper("firewall")
     end
