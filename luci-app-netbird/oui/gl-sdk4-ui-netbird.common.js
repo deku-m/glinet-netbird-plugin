@@ -202,12 +202,14 @@ module.exports = (function () {
       this.refresh();
       this.checkPlugin();
       this.checkClient();
-      this.statusTimer = setInterval(this.refresh, 5000);
+      this.statusTimer = setInterval(this.pollStatus, 5000);
+      document.addEventListener('visibilitychange', this.onVisible);
     },
 
     beforeDestroy: function () {
       clearInterval(this.statusTimer);
       clearInterval(this.jobTimer);
+      document.removeEventListener('visibilitychange', this.onVisible);
     },
 
     computed: {
@@ -239,6 +241,16 @@ module.exports = (function () {
         var self = this;
         clearTimeout(this._noticeT);
         if (type !== 'error') this._noticeT = setTimeout(function () { self.notice = null; }, 6000);
+      },
+
+      // every status call starts the netbird CLI on the router: skip it while
+      // the tab is in the background and catch up as soon as it is visible
+      pollStatus: function () {
+        if (!document.hidden) this.refresh();
+      },
+
+      onVisible: function () {
+        if (!document.hidden) this.refresh();
       },
 
       refresh: function () {

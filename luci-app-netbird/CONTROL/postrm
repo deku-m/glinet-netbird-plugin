@@ -1,5 +1,8 @@
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
+# opkg also runs this on an upgrade: the zone, interface and schedule must
+# survive that, so only clean up on a real removal.
+[ "$1" = upgrade ] && exit 0
 for s in netbird netbird_lan_fwd lan_netbird_fwd; do uci -q delete firewall.$s; done
 uci -q delete network.netbird
 if [ -f /etc/crontabs/root ] && grep -q 'netbird-luci autoupdate' /etc/crontabs/root; then

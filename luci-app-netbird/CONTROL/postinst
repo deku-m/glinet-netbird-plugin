@@ -13,7 +13,19 @@ uci -q commit netbird
 mkdir -p /etc/netbird && chmod 700 /etc/netbird
 rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
 /etc/init.d/rpcd reload 2>/dev/null
-[ "$(uci -q get netbird.main.enabled)" = 1 ] && /etc/init.d/netbird enable && /etc/init.d/netbird restart
+# Versions up to 1.2.5 removed the firewall zone, interface and autoupdate
+# schedule during every upgrade; restore them from the settings. Only for a
+# router that is already registered, so a fresh install changes nothing.
+if [ -s /etc/netbird/default.json ]; then
+	/usr/libexec/netbird-luci firewall >/dev/null 2>&1
+fi
+/usr/libexec/netbird-luci cron >/dev/null 2>&1
+# start, not restart: a running NetBird is left alone (procd only restarts
+# it when its command line changed); older versions stopped it in prerm.
+if [ "$(uci -q get netbird.main.enabled)" = 1 ]; then
+	/etc/init.d/netbird enable
+	/etc/init.d/netbird start
+fi
 # GL admin panel: nginx caches the Lua RPC modules, so new or changed
 # methods only appear after its workers restart. Graceful reload, delayed so
 # a panel request that started this install can still finish.

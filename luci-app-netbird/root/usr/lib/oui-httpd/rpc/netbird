@@ -161,7 +161,9 @@ function M.set_config(args)
 
     for k, v in pairs(clean) do uci_set(k, v) end
     run("uci -q commit netbird")
-    helper("firewall")
+    if args.firewall_zone ~= nil or args.lan_to_netbird ~= nil or args.netbird_to_lan ~= nil or args.masquerade ~= nil then
+        helper("firewall")
+    end
     if args.client_autoupdate ~= nil then helper("cron") end
     if args.update_repo ~= nil then os.remove("/tmp/netbird-luci-check-plugin.json") end
     return { ok = true, config = read_config() }

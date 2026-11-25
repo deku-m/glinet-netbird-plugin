@@ -579,6 +579,11 @@ start_plugin_job() {
 	echo '{"started":true}'
 }
 
+fw_snapshot() {
+	uci -q show firewall | grep -E '^firewall\.(netbird|netbird_lan_fwd|lan_netbird_fwd)[.=]'
+	uci -q show network.netbird
+}
+
 # Network interface + firewall zone for wt0, driven by UCI options.
 do_firewall() {
 	config_load netbird
@@ -587,14 +592,13 @@ do_firewall() {
 	config_get_bool n2l main netbird_to_lan 1
 	config_get_bool masq main masquerade 1
 
-	changed=0
+	before="$(fw_snapshot)"
 	if [ "$fw" = 1 ]; then
 		if [ "$(uci -q get network.netbird)" != interface ]; then
 			uci set network.netbird=interface
 			uci set network.netbird.proto=none
 			uci set network.netbird.device=wt0
 			uci commit network
-			changed=1
 		fi
 		uci -q delete firewall.netbird
 		uci set firewall.netbird=zone
@@ -618,17 +622,17 @@ do_firewall() {
 			uci set firewall.lan_netbird_fwd.dest=netbird
 		fi
 		uci commit firewall
-		changed=1
 	else
 		for s in netbird netbird_lan_fwd lan_netbird_fwd; do
-			uci -q delete firewall.$s && changed=1
+			uci -q delete firewall.$s
 		done
 		uci commit firewall
 		if uci -q get network.netbird >/dev/null; then
-			uci delete network.netbird; uci commit network; changed=1
+			uci delete network.netbird; uci commit network
 		fi
 	fi
-	if [ $changed = 1 ]; then
+	# a reload briefly touches every interface/rule, so only when needed
+	if [ "$before" != "$(fw_snapshot)" ]; then
 		/etc/init.d/network reload >/dev/null 2>&1
 		/etc/init.d/firewall reload >/dev/null 2>&1
 	fi

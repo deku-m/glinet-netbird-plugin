@@ -1,5 +1,8 @@
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
+# opkg also runs this on an upgrade ("upgrade <new-version>"): keep NetBird
+# running then; only a real removal stops it.
+[ "$1" = upgrade ] && exit 0
 /etc/init.d/netbird stop 2>/dev/null
 /etc/init.d/netbird disable 2>/dev/null
 exit 0
