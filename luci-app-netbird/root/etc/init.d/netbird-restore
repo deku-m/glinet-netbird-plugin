@@ -1,0 +1,103 @@
+#!/bin/sh /etc/rc.common
+# Reinstalls luci-app-netbird after a firmware upgrade.
+#
+# A firmware upgrade replaces all installed packages; only files in the
+# backup list survive. This script, its rc.d link and /etc/netbird (with a
+# copy of the plugin package) are on that list (lib/upgrade/keep.d), so on
+# the first boot of the new firmware it finds the plugin missing and
+# installs it again with opkg. Uninstalling the plugin removes all of it.
+
+START=95
+EXTRA_COMMANDS="restore save_copy"
+EXTRA_HELP="	restore		Reinstall the plugin if it is missing
+	save_copy	Store the latest release as restore copy (when none exists)"
+
+PKG=luci-app-netbird
+COPY_DIR=/etc/netbird/plugin
+COPY="$COPY_DIR/$PKG.ipk"
+TAG=netbird-restore
+
+log() { logger -t "$TAG" "$*"; }
+
+installed() {
+	opkg list-installed "$PKG" 2>/dev/null | grep -q "^$PKG "
+}
+
+fetch() {
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 15 -o "$2" "$1"
+	else
+		wget -q -T 30 -O "$2" "$1"
+	fi
+}
+
+repo() {
+	r="$(uci -q get netbird.main.update_repo)"
+	[ -n "$r" ] || r="$(head -n1 /usr/share/netbird-luci/update_repo 2>/dev/null)"
+	echo "$r" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' && echo "$r"
+}
+
+is_our_package() {
+	[ "$(tar -xzOf "$1" ./control.tar.gz 2>/dev/null | tar -xzO ./control 2>/dev/null |
+		awk -F': ' '$1 == "Package" {print $2; exit}')" = "$PKG" ]
+}
+
+# Downloads the newest release of the update repo, checksum-verified, to $1.
+download_latest() {
+	r="$(repo)" || return 1
+	work="/tmp/$TAG.$$"
+	rm -rf "$work"; mkdir -p "$work"
+	base="https://github.com/$r/releases/latest/download"
+	if ! fetch "$base/SHA256SUMS" "$work/sums"; then rm -rf "$work"; return 1; fi
+	line="$(grep -E "^[0-9a-f]{64}[ *]+${PKG}_[A-Za-z0-9.~+-]+_all\.ipk\$" "$work/sums" | head -n1)"
+	sum="${line%% *}"; file="$(echo "$line" | awk '{f=$2; sub(/^\*/, "", f); print f}')"
+	if [ -z "$file" ] || ! fetch "$base/$file" "$work/pkg.ipk"; then rm -rf "$work"; return 1; fi
+	if [ "$(sha256sum "$work/pkg.ipk" | awk '{print $1}')" != "$sum" ] || ! is_our_package "$work/pkg.ipk"; then
+		log "downloaded package failed verification, not using it"
+		rm -rf "$work"; return 1
+	fi
+	mv -f "$work/pkg.ipk" "$1"
+	rm -rf "$work"
+}
+
+restore() {
+	installed && return 0
+	if [ -s "$COPY" ] && is_our_package "$COPY"; then
+		log "plugin missing after firmware upgrade, reinstalling from saved copy"
+		opkg install "$COPY" >/dev/null 2>&1 && { log "plugin reinstalled"; return 0; }
+		log "reinstall from saved copy failed, trying the update repository"
+	fi
+	# the uplink may need a while after boot (repeater, 5G): retry for ~10 min
+	tries=0
+	while [ $tries -lt 20 ]; do
+		tmp="/tmp/$TAG.ipk"
+		if download_latest "$tmp"; then
+			if opkg install "$tmp" >/dev/null 2>&1; then
+				mkdir -p "$COPY_DIR" && mv -f "$tmp" "$COPY"
+				log "plugin reinstalled from $(repo)"
+				return 0
+			fi
+			log "opkg install of downloaded plugin failed"
+			rm -f "$tmp"
+			return 1
+		fi
+		tries=$((tries + 1))
+		sleep 30
+	done
+	log "could not reinstall the plugin: no saved copy and no download from the update repository"
+	return 1
+}
+
+# Called after a manual install: keep a restore copy when none exists yet.
+save_copy() {
+	[ -s "$COPY" ] && return 0
+	tmp="/tmp/$TAG.copy"
+	download_latest "$tmp" || return 0
+	mkdir -p "$COPY_DIR" && mv -f "$tmp" "$COPY"
+}
+
+start() {
+	installed && return 0
+	# in the background: opkg and the network are not ready this early
+	( sleep 20; /etc/init.d/netbird-restore restore ) </dev/null >/dev/null 2>&1 &
+}

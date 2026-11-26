@@ -556,6 +556,8 @@ plugin_install() {
 	echo "Installing..."
 	if opkg install "$1" 2>&1; then
 		invalidate_checks
+		# copy for reinstalling after a firmware upgrade (see netbird-restore)
+		mkdir -p "$STATE_DIR/plugin" && cp -f "$1" "$STATE_DIR/plugin/$PKG.ipk"
 		echo "Plugin is now version $(plugin_version)"
 		echo "DONE"
 	else

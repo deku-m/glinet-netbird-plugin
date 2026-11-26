@@ -1,6 +1,11 @@
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
-chmod 755 /usr/libexec/netbird-luci /etc/init.d/netbird
+chmod 755 /usr/libexec/netbird-luci /etc/init.d/netbird /etc/init.d/netbird-restore
+# survives firmware upgrades and reinstalls this package afterwards
+/etc/init.d/netbird-restore enable
+# manual installs (LuCI, SSH) leave no package file behind: fetch a restore
+# copy from the update repository in the background, if one is set
+(/etc/init.d/netbird-restore save_copy) </dev/null >/dev/null 2>&1 &
 # options added in later versions: keep existing configs complete
 for kv in network_monitor=1 clear_setup_key=1 log_level=info; do
 	uci -q get "netbird.main.${kv%%=*}" >/dev/null || uci -q set "netbird.main.$kv"

@@ -35,8 +35,8 @@ same package also adds pages to LuCI (VPN > NetBird).
   every peer with P2P/relayed, latency and traffic.
 - **Follows uplink changes**: reconnects right away when the router switches
   between cable, repeater, 5G or tethering.
-- **Survives reboots and firmware upgrades**: starts at boot and keeps its
-  registration (`/etc/netbird`) across sysupgrade.
+- **Survives reboots and firmware upgrades**: starts at boot, keeps its
+  registration, and reinstalls itself after a firmware upgrade (see below).
 - **Firewall zone** `netbird` (interface `wt0`) with optional LAN ↔ NetBird
   forwarding and masquerade.
 - **NetBird client updates**: shows when a new NetBird release is out and
@@ -82,6 +82,18 @@ same package also adds pages to LuCI (VPN > NetBird).
   The NetBird client is updated on its own; no new plugin release is needed.
 
 Settings and the NetBird registration are kept on every update.
+
+## Firmware upgrades
+
+A firmware upgrade removes all installed packages, this plugin included. With
+**Keep Settings** on, the plugin comes back by itself: on the first boot of the
+new firmware it reinstalls from a copy saved in `/etc/netbird/plugin/`, or,
+without a copy, downloads the latest release from its update repository
+(checksum-verified, retrying for about 10 minutes while the uplink comes up).
+NetBird's registration and settings are kept, so it reconnects without a new
+setup key. The log shows what happened: `logread -e netbird-restore`.
+
+Without **Keep Settings**, install the plugin again as described above.
 
 ## Uninstalling
 
