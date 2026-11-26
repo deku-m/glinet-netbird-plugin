@@ -1,2 +1,4 @@
 /etc/netbird/
 /usr/bin/netbird
+/etc/init.d/netbird-restore
+/etc/rc.d/S95netbird-restore

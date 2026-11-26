@@ -1,6 +1,6 @@
 Package: luci-app-netbird
 Version: 1.1.4-1
-Depends: libc, luci-base
+Depends: libc
 Source: local
 License: MIT
 Section: luci
